@@ -3,7 +3,7 @@
 #include <ADC.h>
 #include <ADC_Module.h>
 #include <elapsedMillis.h>
-#define pi 3.1415926535897932384626433832795 //a very round number lmao
+#define pi 3.1415926535897932384626433832795
 #define nHarmonicsSin 1 //number of sin harmonics to calculate (at least 1)       
 #define nHarmonicsCos 1 //number of cos harmonics to calculate (at least 1)
 
@@ -19,68 +19,75 @@ unsigned int outputTime = 100; //number of milliseconds between outputs
 
 ///////////////////////////////////////////////////////////////////////////////////
 
-IntervalTimer lockInTimer;
-elapsedMillis timeElapsed;
-ADC *adc = new ADC();
-bool useSyncFilter = false; //use synchronous filter only for very low frequencies
-int ledPin = 23;
-int i;
-volatile int j;
+IntervalTimer lockInTimer; //object for interrupt loop used for lock-in algorithm
+elapsedMillis timeElapsed; //counter for time between output samples
+ADC *adc = new ADC();  //adc object
+bool useSyncFilter = false; //use synchronous filter only for very low frequencies (less than 20 Hz)
+int ledPin = 23; //digital pin for LED driver
+int i; //index for reading from live values
+volatile int j; //index used for calculation within intervalTimer
 double FcutOff = 0.25; //filter cutoff frequency
 double wsig = 2*pi*Fsig; // signal angular frequency
 double dt = 1/Fsample; //sample time in seconds
 int dt_micros = (int)(dt*1000000); //sample time in microseconds
-const int samplesPerPeriod = (int)(Fsample/Fsig);
+const int samplesPerPeriod = (int)(Fsample/Fsig); //number of input samples to measure per reference signal period
 int sampleIndex = 0; //what sample within the current period are we at
 bool wait = true;
 double phasSig; //reference signal values in phase
 double quadSig; //ditto, quadrature
 volatile double delta; //filtering things
-volatile double incr;
-volatile double xiFilt1[nHarmonicsSin];
-volatile double xqFilt1[nHarmonicsCos];
-volatile double xiFilt2[nHarmonicsSin];
-volatile double xqFilt2[nHarmonicsCos];
-volatile double xiVar2[nHarmonicsSin];
+volatile double incr; //small increment
+volatile double xiFilt1[nHarmonicsSin]; //in phase (first filter)
+volatile double xqFilt1[nHarmonicsCos]; //quadrature (first filter)
+volatile double xiFilt2[nHarmonicsSin]; //in phase (second filter)
+volatile double xqFilt2[nHarmonicsCos]; //quadrature (second filter)
+volatile double xiVar2[nHarmonicsSin]; //variances and means
 volatile double xiMean2[nHarmonicsSin];
 volatile double xqVar2[nHarmonicsCos];
 volatile double xqMean2[nHarmonicsCos];
-double grabQuad[nHarmonicsCos];
+double grabQuad[nHarmonicsCos]; //"snapshot" of current values in volatile array
 double grabPhas[nHarmonicsSin];
-double grabVar;
-double lag;
-double rmsMeasured;
-double noise;
+double grabVar; //snapshot of variance
+double lag; //phase value
+double rmsMeasured; //rms value
+double noise; //est. noise
 double xSig; //input signal
-double xi0;
-double xq0;
-double xio0;
+double xi0; //input * ref signal in phase
+double xq0; //input * ref signal quadrature
+double xio0; //buffered values of above for sync filter
 double xqo0;
-//weighting coeffs for filter
+//calculation of weighting coeffs for filter - see: R.G. Lyons, Understanding digital signal processing, 3rd ed., Prentice Hall Publishing, 2011
 double g = cos((2.0 * pi * FcutOff) / Fsample);
-double alpha = g - 1.0 + sqrt(g * g - 4.0 * g + 3.0); // how unusual
+double alpha = g - 1.0 + sqrt(g * g - 4.0 * g + 3.0); 
 double alpha_min = 1.0 - alpha;
 //sync filter circular buffer
 int xBuffer[20000] = {};
-int Io0 = 1;
-int In0 = 0;
+int Io0 = 1; //oldest value index
+int In0 = 0; //newest
 
 
 void setup() {
   pinMode(ledPin, OUTPUT);
   Serial.begin(2000000);
-  delay(1000);
+  delay(1000); //wait for serial port to initialise
+  
+  //set ADC for fastest operation + max resolution and start measurement
   adc->adc0->setConversionSpeed(ADC_CONVERSION_SPEED::HIGH_SPEED); 
   adc->adc0->setSamplingSpeed(ADC_SAMPLING_SPEED::HIGH_SPEED);
   adc->adc0->setResolution(12);
   adc->adc0->setAveraging (1);
   adc->adc0->startContinuous(A0);
+  
+  //start calculation
   lockInTimer.begin(calculate, dt_micros);
   delay(1000);
 }
 
 
 void loop() {
+  //calculations happen in calculate(). This loop grabs the "live" values from the array and outputs via serial
+  
+  //wait until next output time
   while(wait == true){
     if (timeElapsed > outputTime){
       timeElapsed = 0;
@@ -88,6 +95,7 @@ void loop() {
     } 
   }
   
+  //grab values from array. Disallow interrupts (and therefore updating of the values) while doing so
   noInterrupts();
   for (i = 0; i < nHarmonicsSin; ++i){
     grabPhas[i] = xiFilt2[i];
@@ -97,38 +105,24 @@ void loop() {
   }
   grabVar = xqVar2[0];
   interrupts();
-
+  
+  
+  //calculating output values
   lag = atan(grabQuad[0]/grabPhas[0]);
   rmsMeasured = sqrt(grabQuad[0]*grabQuad[0] + grabPhas[0]*grabPhas[0]);
   noise = sqrt(grabVar);
 
   
 
-  Serial.println(rmsMeasured, 5); //total signal amplitude
-//Serial.print(" "); 
-//  Serial.print(lag, 5); //phase measurement
-//  Serial.print(" ");
-//  Serial.print(noise, 5);  //noise estimate
-//  Serial.print(" ");
-//
-//  //output harmonics
-//
-//  for (i = 0; i < nHarmonicsSin; ++i){
-//    Serial.print(grabPhas[i], 5);  //in phase 
-//    Serial.print(" ");
-//  }
-//  for (i = 0; i < nHarmonicsCos; ++i){
-//    Serial.print(grabQuad[i], 5);  //quad
-//    Serial.print(" ");
-//  }
-//  
-//Serial.println("");
+  Serial.println(rmsMeasured, 5); // output total signal amplitude
 
+  //waiting until next output
   wait = true;
   
 }
 
 void calculate(){
+  //acquire input sample
   xSig = (double)adc->analogReadContinuous(A0);
 
   //Using standard exponential filter
@@ -178,8 +172,9 @@ void calculate(){
   }
 
   
-  //using optional synchronous filter instead (only for very low frequencies)
+  //if using optional synchronous filter instead (only for very low frequencies)
   if (useSyncFilter == true){
+    //in-phase harmonics first
     for (j = 0; j < nHarmonicsSin; ++j){
       phasSig = sin(((2.0 * (j + 1) * pi * sampleIndex) / samplesPerPeriod) - ((j + 1) * phaseDiff));
       xi0 = (xSig*phasSig); //multiplication by reference signal
@@ -198,6 +193,7 @@ void calculate(){
       xiVar2[j] = (1 - alpha) * (xiVar2[j] + delta*incr);
       
     }
+    //as before but in quadrature
     for (j = 0; j < nHarmonicsCos; ++j){
       quadSig = cos(((2.0 * (j + 1) * pi * sampleIndex) / samplesPerPeriod) - ((j + 1) * phaseDiff)); 
       xq0 = (xSig*quadSig); 
@@ -223,7 +219,7 @@ void calculate(){
     if (Io0 >= samplesPerPeriod){
       Io0 = Io0 - samplesPerPeriod;
     }
-    //store newest value in buffer
+    //store newest input signal value in buffer
     xBuffer[In0] = xSig;
     
     ++sampleIndex; 
@@ -231,17 +227,16 @@ void calculate(){
 
   
 
-  //LED control
+  //LED control. Toggles every half period
   if (sampleIndex < (samplesPerPeriod/2)){
-    digitalWrite(ledPin, HIGH);
+    digitalWrite(ledPin, HIGH);//LED on
   }
   else {
-    digitalWrite(ledPin, LOW);
+    digitalWrite(ledPin, LOW);//LED off
   }
   
+  //go to beginning if reached end of period
   if (sampleIndex == samplesPerPeriod){
     sampleIndex = 0;
   }
 }
-
-//ayy lmao
