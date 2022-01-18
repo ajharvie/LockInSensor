@@ -1,4 +1,4 @@
-# A sensitive optical detector based on lock-in amplification
+# A sensitive optical detector based on digital lock-in amplification
 
 Andrew J. Harvie, Surendra K. Yadav, John C. de Mello
 
